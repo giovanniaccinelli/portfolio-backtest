@@ -1,7 +1,10 @@
 import altair as alt
 import streamlit as st
 
-from strategy import SECTORS, backtest, load_prices, performance
+from strategy import (
+    BETA_BENCHMARK, CYCLICAL, DEFENSIVE, SECTORS, backtest, load_prices,
+    low_beta_backtest, performance, seasonal_backtest,
+)
 
 st.set_page_config(page_title="Portfolio Backtest", layout="wide")
 st.markdown("""
@@ -20,37 +23,52 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Sector Momentum Rotation")
-st.caption("Yahoo Finance adjusted prices · Monthly rebalancing · Benchmark SPY")
+st.title("Sector Strategies")
+st.caption("Yahoo Finance adjusted prices · U.S. sector ETFs · Benchmark SPY")
 
 with st.container(border=True):
-    st.subheader("Scenario settings")
-    count = st.slider("Number of sectors held", 1, len(SECTORS), 3)
-    st.caption(f"Hold the strongest {count} of nine sectors by trailing 12-month return, equally weighted.")
+    mode = st.selectbox("Strategy", ["Sector momentum", "Sell in May", "Low-beta sectors"])
+    if mode == "Sell in May":
+        use_filter = st.toggle("Use the 10-month SPY trend filter")
+        st.caption("Hold cyclical sectors November–April. The filter requires a SPY downtrend to switch to defensives in May–October.")
+        st.caption(f"Cyclical {' · '.join(CYCLICAL)} / Defensive {' · '.join(DEFENSIVE)}")
+    else:
+        count = st.slider("Number of sectors held", 1, len(SECTORS), 3)
+        if mode == "Sector momentum":
+            st.caption(f"Hold the top {count} sectors by trailing 12-month return, equally weighted.")
+        else:
+            st.caption(f"Hold the {count} lowest-beta sectors, equally weighted. Beta uses 36 monthly returns against SPY.")
 
 cached_prices = st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance prices…")(load_prices)
 try:
-    growth, monthly_returns, last_weights = backtest(cached_prices(), count)
+    prices = cached_prices()
+    if mode == "Sell in May":
+        growth, monthly_returns, last_weights = seasonal_backtest(prices, use_filter)
+    elif mode == "Low-beta sectors":
+        growth, monthly_returns, last_weights = low_beta_backtest(prices, count)
+    else:
+        growth, monthly_returns, last_weights = backtest(prices, count)
 except (ValueError, OSError) as exc:
     st.error(str(exc))
     st.stop()
 
 returns = growth.iloc[-1] - 1
+comparison = BETA_BENCHMARK if mode == "Low-beta sectors" else "SPY"
 
 portfolio_card, benchmark_card, difference_card = st.columns(3)
 portfolio_card.metric("Portfolio total return", f"{returns['Portfolio']:.2%}")
-benchmark_card.metric("SPY total return", f"{returns['SPY']:.2%}")
-difference_card.metric("Return vs. SPY", f"{100 * (returns['Portfolio'] - returns['SPY']):+.2f} pp")
+benchmark_card.metric(f"{comparison} total return", f"{returns[comparison]:.2%}")
+difference_card.metric(f"Return vs. {comparison}", f"{100 * (returns['Portfolio'] - returns[comparison]):+.2f} pp")
 
 st.subheader("Growth of 1.00 invested")
-st.caption("Hover over a point for its month-end value.")
+st.caption(f"{monthly_returns.index[0]:%b %Y} to {monthly_returns.index[-1]:%b %Y} · Both the portfolio and each benchmark start at 1.00.")
 chart_data = growth.reset_index().melt("Date", var_name="Series", value_name="Value")
 chart = alt.Chart(chart_data).mark_line(point=True, strokeWidth=3).encode(
     x=alt.X("Date:T", title=None, axis=alt.Axis(format="%b %y", tickCount=6)),
     y=alt.Y("Value:Q", title=None, scale=alt.Scale(zero=False), axis=alt.Axis(format=".2f")),
     color=alt.Color(
         "Series:N",
-        scale=alt.Scale(domain=["Portfolio", "SPY"], range=["#67e8ba", "#91aeef"]),
+        scale=alt.Scale(domain=list(growth.columns), range=["#67e8ba", "#91aeef", "#f5bc75"][:len(growth.columns)]),
         legend=alt.Legend(title=None, orient="top"),
     ),
     tooltip=[
@@ -79,6 +97,19 @@ with st.expander("Data and assumptions"):
         "following month's return. Trading costs and taxes are excluded. "
         "The original nine SPDR sector ETFs are eligible: " + ", ".join(SECTORS) + "."
     )
+    if mode == "Sell in May":
+        st.write(
+            "The plain calendar rule trades when the basket changes, twice per year after entry. "
+            "Weights start equal at each switch and drift until the next switch. The filtered rule "
+            "checks the prior month-end SPY adjusted close against its trailing 10-month average "
+            "each summer month and can switch more often. Both versions start after the filter has enough data."
+        )
+    if mode == "Low-beta sectors":
+        st.write(
+            "The beta-matched benchmark sets its SPY weight to the portfolio’s estimated beta "
+            "at the previous month-end and assigns the balance to zero-return cash. "
+            "Its SPY weight is uncapped, so estimates above 1 imply borrowing and estimates below 0 imply short exposure."
+        )
     st.write(
         "Annualized average return and regression alpha multiply monthly figures by 12. "
         "Volatility scales monthly sample standard deviation by the square root of 12. "
