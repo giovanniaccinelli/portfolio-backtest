@@ -1,6 +1,7 @@
 import altair as alt
-import pandas as pd
 import streamlit as st
+
+from strategy import SECTORS, backtest, load_prices, performance
 
 st.set_page_config(page_title="Portfolio Backtest", layout="wide")
 st.markdown("""
@@ -19,27 +20,27 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Portfolio Backtest")
-st.caption("Synthetic preview · Monthly observations · Dec 2020 to Dec 2021")
+st.title("Sector Momentum Rotation")
+st.caption("Yahoo Finance adjusted prices · Monthly rebalancing · Benchmark SPY")
 
 with st.container(border=True):
     st.subheader("Scenario settings")
-    cost = st.slider("One-time portfolio cost (basis points)", 0, 100, 20, 5)
-    st.caption(f"{cost} basis points = {cost / 100:.2f}% deducted once, after the starting observation.")
+    count = st.slider("Number of sectors held", 1, len(SECTORS), 3)
+    st.caption(f"Hold the strongest {count} of nine sectors by trailing 12-month return, equally weighted.")
 
-dates = pd.date_range("2020-12-31", periods=13, freq="ME", name="Date")
-portfolio = [1, 1.02, 1.04, 1.03, 1.06, 1.08, 1.04, 1.07, 1.10, 1.07, 1.09, 1.12, 1.13]
-benchmark = [1, 1.01, 1.03, 1.02, 1.03, 1.06, 1.03, 1.05, 1.07, 1.05, 1.07, 1.09, 1.11]
-growth = pd.DataFrame({
-    "Portfolio": [1] + [value * (1 - cost / 10_000) for value in portfolio[1:]],
-    "Benchmark": benchmark,
-}, index=dates)
+cached_prices = st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance prices…")(load_prices)
+try:
+    growth, monthly_returns, last_weights = backtest(cached_prices(), count)
+except (ValueError, OSError) as exc:
+    st.error(str(exc))
+    st.stop()
+
 returns = growth.iloc[-1] - 1
 
 portfolio_card, benchmark_card, difference_card = st.columns(3)
 portfolio_card.metric("Portfolio total return", f"{returns['Portfolio']:.2%}")
-benchmark_card.metric("Benchmark total return", f"{returns['Benchmark']:.2%}")
-difference_card.metric("Return above benchmark", f"{100 * (returns['Portfolio'] - returns['Benchmark']):+.2f} pp")
+benchmark_card.metric("SPY total return", f"{returns['SPY']:.2%}")
+difference_card.metric("Return vs. SPY", f"{100 * (returns['Portfolio'] - returns['SPY']):+.2f} pp")
 
 st.subheader("Growth of 1.00 invested")
 st.caption("Hover over a point for its month-end value.")
@@ -49,7 +50,7 @@ chart = alt.Chart(chart_data).mark_line(point=True, strokeWidth=3).encode(
     y=alt.Y("Value:Q", title=None, scale=alt.Scale(zero=False), axis=alt.Axis(format=".2f")),
     color=alt.Color(
         "Series:N",
-        scale=alt.Scale(domain=["Portfolio", "Benchmark"], range=["#67e8ba", "#91aeef"]),
+        scale=alt.Scale(domain=["Portfolio", "SPY"], range=["#67e8ba", "#91aeef"]),
         legend=alt.Legend(title=None, orient="top"),
     ),
     tooltip=[
@@ -66,9 +67,21 @@ chart = alt.Chart(chart_data).mark_line(point=True, strokeWidth=3).encode(
 ).configure_view(stroke=None)
 st.altair_chart(chart, theme=None)
 
-with st.expander("About these results"):
+st.subheader("Performance measures")
+st.table(performance(monthly_returns))
+st.caption("Final month holdings · " + ", ".join(last_weights[last_weights > 0].index))
+
+with st.expander("Data and assumptions"):
     st.write(
-        "Both series use synthetic monthly values and start at 1.00. "
-        "The slider applies a one-time cost to the portfolio. "
-        "Total return is the final value minus 1.00. The return gap is in percentage points."
+        "The sample uses Yahoo Finance daily closes adjusted for splits and distributions "
+        "from December 1998 through December 2025. The last available close in each month "
+        "sets the signal and is the assumed rebalance price. The new weights apply to the "
+        "following month's return. Trading costs and taxes are excluded. "
+        "The original nine SPDR sector ETFs are eligible: " + ", ".join(SECTORS) + "."
+    )
+    st.write(
+        "Annualized average return and regression alpha multiply monthly figures by 12. "
+        "Volatility scales monthly sample standard deviation by the square root of 12. "
+        "Sharpe and alpha assume a zero risk-free rate. Beta is the slope versus SPY. "
+        "The information ratio uses active return versus SPY and its tracking error."
     )
