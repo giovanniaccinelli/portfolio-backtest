@@ -42,9 +42,19 @@ with st.container(key="hero"):
 with st.container(key="controls"):
     st.markdown("**Backtest settings**")
     lookback_col, holdings_col, frequency_col = st.columns(3)
-    lookback = lookback_col.select_slider("Beta lookback (months)", [24, 36, 60], value=36)
-    count = holdings_col.slider("Sectors held", 2, 5, 3)
-    frequency = frequency_col.select_slider("Rebalancing", ["Monthly", "Quarterly"], value="Monthly")
+    lookback = lookback_col.segmented_control(
+        "Beta lookback", [24, 36, 60], default=36, required=True,
+        format_func=lambda months: f"{months} months",
+        help="How much return history is used to estimate each sector’s beta.",
+    )
+    count = holdings_col.segmented_control(
+        "Sectors held", [2, 3, 4, 5], default=3, required=True,
+        help="The portfolio holds the selected number of lowest-beta sectors.",
+    )
+    frequency = frequency_col.segmented_control(
+        "Rebalancing", ["Monthly", "Quarterly"], default="Monthly", required=True,
+        help="How often the portfolio selects sectors and resets to equal weights.",
+    )
 
 @st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance and FRED data…")
 def load_data():
