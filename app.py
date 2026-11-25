@@ -1,10 +1,7 @@
 import altair as alt
 import streamlit as st
 
-from strategy import (
-    BETA_BENCHMARK, CYCLICAL, DEFENSIVE, SECTORS, backtest, load_prices,
-    low_beta_backtest, performance, seasonal_backtest,
-)
+from strategy import BETA_BENCHMARK, SECTORS, backtest, load_prices, load_risk_free, performance
 
 st.set_page_config(page_title="Portfolio Backtest", layout="wide")
 st.markdown("""
@@ -23,96 +20,106 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Sector Strategies")
-st.caption("Yahoo Finance adjusted prices · U.S. sector ETFs · Benchmark SPY")
+st.title("Low-Beta Sectors")
+st.caption("A defensive U.S. equity allocation · Nine original SPDR sector ETFs")
 
 with st.container(border=True):
-    mode = st.selectbox("Strategy", ["Sector momentum", "Sell in May", "Low-beta sectors"])
-    if mode == "Sell in May":
-        use_filter = st.toggle("Use the 10-month SPY trend filter")
-        st.caption("Hold cyclical sectors November–April. The filter requires a SPY downtrend to switch to defensives in May–October.")
-        st.caption(f"Cyclical {' · '.join(CYCLICAL)} / Defensive {' · '.join(DEFENSIVE)}")
-    else:
-        count = st.slider("Number of sectors held", 1, len(SECTORS), 3)
-        if mode == "Sector momentum":
-            st.caption(f"Hold the top {count} sectors by trailing 12-month return, equally weighted.")
-        else:
-            st.caption(f"Hold the {count} lowest-beta sectors, equally weighted. Beta uses 36 monthly returns against SPY.")
+    lookback_col, holdings_col, frequency_col = st.columns(3)
+    lookback = lookback_col.select_slider("Beta lookback (months)", [24, 36, 60], value=36)
+    count = holdings_col.slider("Sectors held", 2, 5, 3)
+    frequency = frequency_col.select_slider("Rebalancing", ["Monthly", "Quarterly"], value="Monthly")
 
-cached_prices = st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance prices…")(load_prices)
+@st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance and FRED data…")
+def load_data():
+    return load_prices(), load_risk_free()
+
+
 try:
-    prices = cached_prices()
-    if mode == "Sell in May":
-        growth, monthly_returns, last_weights = seasonal_backtest(prices, use_filter)
-    elif mode == "Low-beta sectors":
-        growth, monthly_returns, last_weights = low_beta_backtest(prices, count)
-    else:
-        growth, monthly_returns, last_weights = backtest(prices, count)
+    prices, rates = load_data()
+    growth, returns, weights, rolling_beta, bills = backtest(prices, rates, lookback, count, frequency)
 except (ValueError, OSError) as exc:
-    st.error(str(exc))
+    st.error(f"Unable to load the backtest. {exc}")
     st.stop()
 
-returns = growth.iloc[-1] - 1
-comparison = BETA_BENCHMARK if mode == "Low-beta sectors" else "SPY"
+metrics = performance(returns, bills)
+alpha_card, sharpe_card, beta_card = st.columns(3)
+alpha_card.metric("Annualized alpha vs. SPY", metrics.loc["Annualized alpha vs. SPY", "Portfolio"])
+sharpe_card.metric("Sharpe ratio", metrics.loc["Sharpe ratio", "Portfolio"])
+beta_card.metric("Beta vs. SPY", metrics.loc["Beta vs. SPY", "Portfolio"])
 
-portfolio_card, benchmark_card, difference_card = st.columns(3)
-portfolio_card.metric("Portfolio total return", f"{returns['Portfolio']:.2%}")
-benchmark_card.metric(f"{comparison} total return", f"{returns[comparison]:.2%}")
-difference_card.metric(f"Return vs. {comparison}", f"{100 * (returns['Portfolio'] - returns[comparison]):+.2f} pp")
+colors = alt.Scale(
+    domain=["Portfolio", "SPY", BETA_BENCHMARK],
+    range=["#67e8ba", "#91aeef", "#f5bc75"],
+)
+
+
+def style_chart(chart):
+    return chart.configure(background="#0b1220").configure_axis(
+        labelColor="#aabbd2", titleColor="#eaf0fa", gridColor="#26364d", domain=False,
+    ).configure_legend(
+        labelColor="#eaf0fa", titleColor="#eaf0fa",
+    ).configure_view(stroke=None)
+
+
+def line_chart(data, label):
+    tidy = data.rename_axis("Date").reset_index().melt("Date", var_name="Series", value_name=label)
+    return alt.Chart(tidy).mark_line(strokeWidth=2).encode(
+        x=alt.X("Date:T", title=None),
+        y=alt.Y(f"{label}:Q", title=None, scale=alt.Scale(zero=False)),
+        color=alt.Color("Series:N", scale=colors, legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("Date:T", format="%b %Y"), "Series:N", alt.Tooltip(f"{label}:Q", format=".2f")],
+    ).properties(height=300)
+
 
 st.subheader("Growth of 1.00 invested")
-st.caption(f"{monthly_returns.index[0]:%b %Y} to {monthly_returns.index[-1]:%b %Y} · Both the portfolio and each benchmark start at 1.00.")
-chart_data = growth.reset_index().melt("Date", var_name="Series", value_name="Value")
-chart = alt.Chart(chart_data).mark_line(point=True, strokeWidth=3).encode(
-    x=alt.X("Date:T", title=None, axis=alt.Axis(format="%b %y", tickCount=6)),
-    y=alt.Y("Value:Q", title=None, scale=alt.Scale(zero=False), axis=alt.Axis(format=".2f")),
-    color=alt.Color(
-        "Series:N",
-        scale=alt.Scale(domain=list(growth.columns), range=["#67e8ba", "#91aeef", "#f5bc75"][:len(growth.columns)]),
-        legend=alt.Legend(title=None, orient="top"),
-    ),
-    tooltip=[
-        alt.Tooltip("Date:T", format="%b %Y"),
-        alt.Tooltip("Series:N"),
-        alt.Tooltip("Value:Q", format=".3f"),
-    ],
-).properties(height=320).configure(
-    background="#0b1220"
-).configure_axis(
-    labelColor="#aabbd2", gridColor="#26364d", domain=False, ticks=False
-).configure_legend(
-    labelColor="#eaf0fa"
-).configure_view(stroke=None)
-st.altair_chart(chart, theme=None)
+st.caption(f"{returns.index[0]:%b %Y} to {returns.index[-1]:%b %Y} · All series start at 1.00.")
+st.altair_chart(style_chart(line_chart(growth, "Value")), theme=None)
 
 st.subheader("Performance measures")
-st.table(performance(monthly_returns))
-st.caption("Final month holdings · " + ", ".join(last_weights[last_weights > 0].index))
+st.table(metrics)
+active = returns["Portfolio"] - returns["SPY"]
+st.caption(
+    f"The portfolio’s annualized return gap versus SPY is {12 * active.mean():+.2%}, "
+    f"with {12 ** 0.5 * active.std():.2%} annualized tracking error. "
+    "The information ratio is the return gap divided by tracking error."
+)
 
-with st.expander("Data and assumptions"):
+st.subheader("Sector holdings")
+st.caption("Weights at the start of each return month.")
+holdings = weights.rename_axis("Date").reset_index().melt("Date", var_name="Sector", value_name="Weight")
+heatmap = alt.Chart(holdings).mark_rect().encode(
+    x=alt.X("yearmonth(Date):T", title=None),
+    y=alt.Y("Sector:N", sort=list(SECTORS), title=None),
+    color=alt.Color("Weight:Q", scale=alt.Scale(range=["#142136", "#67e8ba"]), legend=alt.Legend(format=".0%")),
+    tooltip=[alt.Tooltip("Date:T", format="%b %Y"), "Sector:N", alt.Tooltip("Weight:Q", format=".1%")],
+).properties(height=200)
+st.altair_chart(style_chart(heatmap), theme=None)
+
+st.subheader("Rolling beta vs. SPY")
+st.caption("Realized beta over 36 months of excess returns. The lookback control sets the window used to select holdings.")
+st.altair_chart(style_chart(line_chart(rolling_beta.dropna(), "Beta")), theme=None)
+
+with st.expander("Strategy, methodology and risks"):
     st.write(
-        "The sample uses Yahoo Finance daily closes adjusted for splits and distributions "
-        "from December 1998 through December 2025. The last available close in each month "
-        "sets the signal and is the assumed rebalance price. The new weights apply to the "
-        "following month's return. Trading costs and taxes are excluded. "
-        "The original nine SPDR sector ETFs are eligible: " + ", ".join(SECTORS) + "."
+        "The strategy is designed for defensive equity investors, including retirees and pension funds. "
+        "The portfolio ranks nine U.S. sector ETFs by beta against SPY using monthly excess returns. "
+        "It starts with equal weights in the lowest-beta sectors after each rebalance. Quarterly portfolios "
+        "rebalance at quarter boundaries and weights drift between trades. Under borrowing constraints, investors "
+        "may bid up high-beta stocks, while benchmarked managers may avoid low-beta stocks."
     )
-    if mode == "Sell in May":
-        st.write(
-            "The plain calendar rule trades when the basket changes, twice per year after entry. "
-            "Weights start equal at each switch and drift until the next switch. The filtered rule "
-            "checks the prior month-end SPY adjusted close against its trailing 10-month average "
-            "each summer month and can switch more often. Both versions start after the filter has enough data."
-        )
-    if mode == "Low-beta sectors":
-        st.write(
-            "The beta-matched benchmark sets its SPY weight to the portfolio’s estimated beta "
-            "at the previous month-end and assigns the balance to zero-return cash. "
-            "Its SPY weight is uncapped, so estimates above 1 imply borrowing and estimates below 0 imply short exposure."
-        )
     st.write(
-        "Annualized average return and regression alpha multiply monthly figures by 12. "
-        "Volatility scales monthly sample standard deviation by the square root of 12. "
-        "Sharpe and alpha assume a zero risk-free rate. Beta is the slope versus SPY. "
-        "The information ratio uses active return versus SPY and its tracking error."
+        "ETF returns use Yahoo Finance adjusted month-end closes. The sample ends in December 2025. "
+        "FRED’s 3-month T-bill discount yield (DTB3) at the prior month-end is converted to an estimated "
+        "one-month cash return. The beta-matched benchmark updates monthly and invests the portfolio’s "
+        "estimated beta in SPY, with the balance in T-bills. Matching the estimated beta puts both portfolios "
+        "on a similar market-risk footing at the start of each month. Exposures are uncapped."
     )
+    st.write(
+        "Alpha is the annualized intercept on monthly excess returns. Sharpe uses excess returns over T-bills. "
+        "Average return is annualized arithmetically. Trades are assumed to execute at the signal close. "
+        "Trading costs and taxes are excluded. Risks include sector concentration, rate sensitivity, noisy beta "
+        "estimates, crowding and lag in strong bull markets. Utilities and staples can be sensitive to rising rates. "
+        "The strategy uses raw beta estimates. A Blume adjustment (0.67 × beta + 0.33) would pull "
+        "exposures toward 1 while preserving the sector ranking."
+    )
+    st.caption("Black, Jensen & Scholes (1972) · Baker, Bradley & Wurgler (2011) · Frazzini & Pedersen (2014)")
