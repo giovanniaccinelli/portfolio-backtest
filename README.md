@@ -10,3 +10,5 @@ python -m streamlit run app.py
 The dashboard uses Yahoo Finance adjusted prices and FRED's 3-month T-bill series (DTB3). Interactive comparisons run from January 2004 through December 2025. The full-period default strategy is also reported from January 2002. The beta-matched benchmark resets monthly to the portfolio's estimated exposure, with the balance in T-bills. Portfolio returns are shown gross and net of the selected trading cost. Taxes are excluded.
 
 [Open the Streamlit app](https://portfolio-backtest-9z9lbgy9gbnsgzzgbvbdz6.streamlit.app/)
+
+Import the shared backtest from `strategy_v2.py` when reproducing the dashboard in a notebook.

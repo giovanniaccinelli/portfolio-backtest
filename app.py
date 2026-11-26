@@ -2,7 +2,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from strategy import BETA_BENCHMARK, SECTORS, backtest, load_prices, load_risk_free, performance
+from strategy_v2 import BETA_BENCHMARK, SECTORS, backtest, load_prices, load_risk_free, performance
 
 st.set_page_config(page_title="Low-Beta Sectors", layout="wide")
 st.markdown("""
