@@ -1,4 +1,5 @@
 import altair as alt
+import pandas as pd
 import streamlit as st
 
 from strategy import BETA_BENCHMARK, SECTORS, backtest, load_prices, load_risk_free, performance
@@ -55,6 +56,8 @@ with st.container(key="controls"):
         "Rebalancing", ["Monthly", "Quarterly"], default="Monthly", required=True,
         help="How often the portfolio selects sectors and resets to equal weights.",
     )
+    cost_bp = st.slider("Trading cost (basis points per purchase or sale)", 0, 50, 10)
+    st.caption("All settings use January 2004 through December 2025. The full-period base case is in Comparisons.")
 
 @st.cache_data(ttl=3600, show_spinner="Fetching Yahoo Finance and FRED data…")
 def load_data():
@@ -63,16 +66,22 @@ def load_data():
 
 try:
     prices, rates = load_data()
-    growth, returns, weights, rolling_beta, bills = backtest(prices, rates, lookback, count, frequency)
+    growth, returns, weights, rolling_beta, bills, gross, turnover = backtest(
+        prices, rates, lookback, count, frequency, cost_bp=cost_bp, details=True,
+    )
 except (ValueError, OSError) as exc:
     st.error(f"Unable to load the backtest. {exc}")
     st.stop()
 
 metrics = performance(returns, bills)
+gross_metrics = performance(gross, bills)
 alpha_card, sharpe_card, beta_card = st.columns(3)
 alpha_card.metric("Annualized alpha vs. SPY", metrics.loc["Annualized alpha vs. SPY", "Portfolio"])
 sharpe_card.metric("Sharpe ratio", metrics.loc["Sharpe ratio", "Portfolio"])
-beta_card.metric("Beta vs. SPY", metrics.loc["Beta vs. SPY", "Portfolio"])
+beta_card.metric("Alpha t-statistic", metrics.loc["Alpha t-statistic (OLS)", "Portfolio"])
+alpha_t = float(metrics.loc["Alpha t-statistic (OLS)", "Portfolio"])
+if abs(alpha_t) < 1.97:
+    st.caption("Net alpha is not statistically significant at the 5% level using conventional OLS standard errors.")
 
 colors = alt.Scale(
     domain=["Portfolio", "SPY", BETA_BENCHMARK],
@@ -115,18 +124,20 @@ def line_chart(data, label):
     return (lines + targets + rule).properties(height=320)
 
 
-overview, holdings_tab, risk_tab, methodology = st.tabs(
-    ["Performance", "Holdings", "Market risk", "Methodology"]
+overview, holdings_tab, risk_tab, comparisons, methodology = st.tabs(
+    ["Performance", "Holdings", "Market risk", "Comparisons", "Methodology"]
 )
 
 with overview:
     with st.container(key="performance"):
         st.subheader("Growth of 1.00 invested")
-        st.caption(f"{returns.index[0]:%b %Y} to {returns.index[-1]:%b %Y} · All series start at 1.00.")
+        st.caption(f"{returns.index[0]:%b %Y} to {returns.index[-1]:%b %Y} · Portfolio is net of trading costs. All series start at 1.00.")
         st.altair_chart(style_chart(line_chart(growth, "Value")), theme=None)
     with st.container(key="metrics"):
         st.subheader("Performance measures")
-        st.table(metrics)
+        report = metrics.rename(columns={"Portfolio": "Portfolio net"})
+        report.insert(0, "Portfolio gross", gross_metrics["Portfolio"])
+        st.table(report)
         active = returns["Portfolio"] - returns["SPY"]
         st.caption(
             f"The portfolio’s annualized return gap versus SPY is {12 * active.mean():+.2%}, "
@@ -138,6 +149,16 @@ with holdings_tab:
     with st.container(key="holdings"):
         st.subheader("Sector holdings")
         st.caption("Weights at the start of each return month.")
+        held = weights.gt(0)
+        sets = held.apply(lambda row: " / ".join(row.index[row]), axis=1)
+        most_common = sets.value_counts(normalize=True)
+        st.write(f"**Most common holdings:** {most_common.index[0]} ({most_common.iloc[0]:.1%} of months).")
+        if len(most_common) == 1:
+            st.caption("The holdings never rotate in this scenario. The strategy behaves like a static sector tilt.")
+        else:
+            st.caption(f"{len(most_common)} distinct combinations. A dominant combination can indicate a persistent defensive tilt.")
+        st.caption(f"Annualized turnover is {12 * turnover.mean():.1%} of portfolio value, counting buys and sells.")
+        st.line_chart(turnover.rename("Trading volume / portfolio value"), height=145)
         holdings = weights.rename_axis("Date").reset_index().melt("Date", var_name="Sector", value_name="Weight")
         heatmap = alt.Chart(holdings).mark_rect().encode(
             x=alt.X("yearmonth(Date):T", title=None),
@@ -153,10 +174,46 @@ with risk_tab:
         st.caption("Realized beta over 36 months of excess returns. The lookback control sets the window used to select holdings.")
         st.altair_chart(style_chart(line_chart(rolling_beta.dropna(), "Beta")), theme=None)
 
+with comparisons:
+    st.subheader("Monthly vs. quarterly")
+    comparison_rows = {}
+    for schedule in ("Monthly", "Quarterly"):
+        _, net, _, _, rf, before_cost, traded = backtest(
+            prices, rates, lookback, count, schedule, cost_bp=cost_bp, details=True,
+        )
+        before = performance(before_cost, rf)
+        after = performance(net, rf)
+        comparison_rows[schedule] = {
+            "Gross CAGR": before.loc["CAGR", "Portfolio"],
+            "Net CAGR": after.loc["CAGR", "Portfolio"],
+            "Net Sharpe": after.loc["Sharpe ratio", "Portfolio"],
+            "Annualized turnover": f"{12 * traded.mean():.1%}",
+        }
+    st.table(pd.DataFrame.from_dict(comparison_rows, orient="index"))
+
+    st.subheader("Net Sharpe across all lookbacks and sector counts")
+    st.caption(f"{frequency} rebalancing at {cost_bp} bp per trade, January 2004 to December 2025.")
+    robust = {}
+    for window in (24, 36, 60):
+        robust[f"{window} months"] = {}
+        for sectors in range(2, 6):
+            _, net, _, _, rf = backtest(prices, rates, window, sectors, frequency, cost_bp=cost_bp)
+            robust[f"{window} months"][f"{sectors} sectors"] = performance(net, rf).loc["Sharpe ratio", "Portfolio"]
+    st.table(pd.DataFrame.from_dict(robust, orient="index"))
+
+    st.subheader("Full-period base case")
+    _, base, _, _, base_rf, base_gross, _ = backtest(
+        prices, rates, cost_bp=cost_bp, start="2002-01-01", details=True,
+    )
+    st.caption("36-month lookback · 3 sectors · Monthly · January 2002 to December 2025")
+    base_report = performance(base, base_rf).rename(columns={"Portfolio": "Portfolio net"})
+    base_report.insert(0, "Portfolio gross", performance(base_gross, base_rf)["Portfolio"])
+    st.table(base_report)
+
 with methodology:
     st.subheader("Strategy, methodology and risks")
     st.write(
-        "The strategy is designed for defensive equity investors, including retirees and pension funds. "
+        "The strategy is designed for defensive equity investors, including retirees and pension funds with a horizon of 10 years or more. They prioritize smaller losses in market declines and accept lagging in strong bull markets. "
         "The portfolio ranks nine U.S. sector ETFs by beta against SPY using monthly excess returns. "
         "It starts with equal weights in the lowest-beta sectors after each rebalance. Quarterly portfolios "
         "rebalance at quarter boundaries and weights drift between trades. Under borrowing constraints, investors "
@@ -172,9 +229,10 @@ with methodology:
     st.write(
         "Alpha is the annualized intercept on monthly excess returns. Sharpe uses excess returns over T-bills. "
         "Average return is annualized arithmetically. Trades are assumed to execute at the signal close. "
-        "Trading costs and taxes are excluded. Risks include sector concentration, rate sensitivity, noisy beta "
+        "Trading costs apply to the sum of absolute trades from drifted weights, excluding initial entry and benchmark costs. Taxes are excluded. Risks include sector concentration, rate sensitivity, noisy beta "
         "estimates, crowding and lag in strong bull markets. Utilities and staples can be sensitive to rising rates. "
-        "The strategy uses raw beta estimates. A Blume adjustment (0.67 × beta + 0.33) would pull "
-        "exposures toward 1 while preserving the sector ranking."
+        "Selection uses raw beta estimates. The universe excludes XLRE and XLC for lack of full history. "
+        "Sector composition changed when communication services was carved out in 2018 and Visa and Mastercard "
+        "moved from technology to financials in 2023."
     )
     st.caption("Black, Jensen & Scholes (1972) · Baker, Bradley & Wurgler (2011) · Frazzini & Pedersen (2014)")
